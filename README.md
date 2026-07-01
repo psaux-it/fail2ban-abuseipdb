@@ -1,4 +1,4 @@
-# Fail2Ban AbuseIPDB Reporter (Enhanced)
+# Fail2Ban AbuseIPDB Reporter
  
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Shell](https://img.shields.io/badge/Shell-Bash-4EAA25?logo=gnu-bash&logoColor=white)](#)
@@ -25,23 +25,28 @@ Unlike the stock Fail2Ban `abuseipdb.conf` action, this script is built to survi
  
 ## 🧠 How It Works
  
-```
-Fail2Ban ban event
-        │
-        ▼
- actionban triggered ──► per-IP flock (dedup) ──► worker pool slot (MAX_WORKERS)
-        │
-        ▼
- check local SQLite DB ──► check AbuseIPDB (/v2/check)
-        │
-        ├── already reported & still listed ─► skip
-        ├── in 15-min cooldown ─────────────► skip
-        └── needs reporting ────────────────► insert/update DB ──► report (/v2/report)
-                                                                        │
-                                                            success ────┴──── failure → rollback DB entry
-```
+<img width="2100" height="1180" alt="Image" src="https://github.com/user-attachments/assets/f5eca6ad-c508-4423-80c3-cc1fe140754e" />
+ 
+Every ban follows the same path: `actionban` fires → the IP acquires a **per-IP dedup lock** and a **worker-pool slot** (see Worker Pool Semaphore) → the script checks its local SQLite DB and AbuseIPDB's `/v2/check` → and based on that, either **skips** (already reported & still listed, or within the 15-minute cooldown) or **reports** the IP via `/v2/report`, updating the local DB on success or rolling back the DB row on failure.
  
 On `actionstart`, the script provisions the runtime directories, verifies dependencies (`curl`, `jq`, `sqlite3`), creates/migrates the SQLite schema, and writes a completion lock so redundant Fail2Ban restarts don't re-run initialization. If initialization ever fails, `actionban` is blocked outright rather than reporting against a broken environment.
+ 
+---
+
+## 🔐 Worker Pool Semaphore (Concurrency Model)
+ 
+<img width="900" height="542" alt="Image" src="https://github.com/user-attachments/assets/d7366cdb-eebd-4274-bb8f-639b5eaae09f" />
+ 
+Every Fail2Ban ban event triggers `actionban` as its own **background subshell** (`& ... ) >> "${LOG_FILE}" 2>&1 &`), so under a ban burst, many IPs can hit the script at almost the same instant. Without a limiter, that means dozens of simultaneous `curl` calls to AbuseIPDB and dozens of concurrent SQLite writers.
+ 
+The script solves this with a **file-lock-based counting semaphore**, sized by `MAX_WORKERS`:
+ 
+1. **Numbered slot files.** `MAX_WORKERS` lock files are used as slots — `abuseipdb_worker_1.lock`, `abuseipdb_worker_2.lock`, … `abuseipdb_worker_N.lock` — one per allowed concurrent worker (`MAX_WORKERS = 3` in the diagram above).
+2. **Non-blocking acquisition.** Each incoming IP's subshell loops over the slot numbers and tries `flock -n 8` (non-blocking) on each slot file in turn. The **first slot that isn't currently held by another process** is acquired — that's the "Slot 1 / Slot 2 / Slot 3" boxes in the diagram, each mapped to one active IP.
+3. **Pool-full backpressure.** If all slots are held (IP 4 in the diagram, arriving after Slots 1–3 are already busy), the subshell doesn't fail or drop the ban — it `sleep 1`s and retries the whole scan until a slot frees up. This is logged as a `WARNING: ... pool may be saturated` if the wait exceeds 30 seconds, which is your signal to raise `MAX_WORKERS`.
+4. **Work inside the slot.** Once a slot is acquired, the IP proceeds through the actual reporting pipeline shown at the bottom of the diagram: check the local SQLite DB → `/v2/check` (already listed?) → `/v2/report` (submit) → update the local DB with the new `last_reported_at` timestamp (or roll back the DB row if the report call failed).
+5. **Automatic release.** The slot's `flock` is held only for the lifetime of that IP's subshell. As soon as the subshell exits — success or failure — the file descriptor closes, the lock is released automatically (no explicit "unlock" call needed), and the **next waiting IP in the retry loop immediately acquires that freed slot**.
+This design caps AbuseIPDB API concurrency at exactly `MAX_WORKERS` regardless of how many IPs are banned simultaneously, while guaranteeing every ban is *eventually* processed — bans queue behind the semaphore, they are never silently dropped. It runs independently of the **per-IP dedup lock** (`abuseipdb_<ip>.lock`), which prevents the *same* IP from being double-processed by overlapping triggers; the worker-pool semaphore instead limits *total* concurrent throughput across *different* IPs.
  
 ---
  
@@ -168,6 +173,19 @@ CREATE INDEX idx_ip ON banned_ips(ip);
 ```
  
 The schema is created and migrated automatically on `actionstart`; existing installs are upgraded in place (e.g. `last_reported_at` is added via `ALTER TABLE` if missing).
+ 
+---
+
+### The Isolated Database's Exact Role
+ 
+The local SQLite DB matters in one specific scenario: **the same IP gets banned again.**
+ 
+It solves two problems:
+ 
+1. **API quota protection (primary).** `/v2/check` and `/v2/report` share a daily quota. Without the DB, every repeat ban of an already-known IP would blindly hit `/v2/report` again. The DB is a cheap local gate: *"never seen this IP before?"* → report immediately, no check needed; *"seen it before?"* → ask AbuseIPDB first before deciding whether to re-report.
+2. **Fail2Ban restart isolation (secondary).** With `BYPASS_FAIL2BAN=1`, the script ignores Fail2Ban's own `<restored>` flag on restart and decides independently — from its own DB — what's already been reported.
+
+**What the DB is *not*:** it is not a live ban list, not a record of currently active Fail2Ban bans, not an expiry/TTL tracker (the `bantime` column is stored for reference only and nothing ever purges a row when a ban expires), and it's not a substitute for `fail2ban-client status`. It only ever answers one question: *"Have we already told AbuseIPDB about this IP, and is that report still relevant?"*
  
 ---
  
